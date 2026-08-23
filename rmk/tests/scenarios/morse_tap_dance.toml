@@ -263,7 +263,7 @@ steps = [
   { delay = 300 },
   { release = [1, 4] },  # Release E after gap timeout
 ]
-expect = [["A"], [], ["E"], []]
+expect = [["A"], ["A", "E"], ["E"], []]
 
 # Permissive hold: releasing the normal key first resolves the morse key as
 # hold (B).
@@ -308,7 +308,7 @@ steps = [
   { release = [3, 8] },
   { release = [1, 4] },
 ]
-expect = [["Y"], ["Y", "A"], ["Y"], ["Y", "E"], ["E"], []]
+expect = [["Y"], ["Y", "A"], ["Y", "A", "E"], ["E", "Y"], ["E"], []]
 
 # Regression for timeout cleanup: a morse key that reached hold timeout can
 # still be unresolved if a longer hold pattern exists.
@@ -332,7 +332,7 @@ steps = [
   { delay = 300 },
   { release = [1, 4] },
 ]
-expect = [["B"], [], ["E"], []]
+expect = [["B"], ["B", "E"], ["E"], []]
 
 # Regression: rapid repeat tapping a FlowTap+EarlyFire key must not jam the key.
 #

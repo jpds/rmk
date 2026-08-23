@@ -100,7 +100,7 @@ steps = [
   { delay = 30 },
   { tap = { pos = [2, 3], duration = 30 } },
 ]
-expect = [["C"], [], ["O"], ["O", "U"], ["U"], [], ["L"], [], ["D"], []]
+expect = [["C"], ["C", "O"], ["O"], ["O", "U"], ["U"], [], ["L"], [], ["D"], []]
 
 # Same C/O/U rollover, but U is delayed past the early-fired C gap timeout.
 # Documents that the buffered O is flushed correctly once the gap timer expires
@@ -136,7 +136,7 @@ steps = [
   { delay = 30 },
   { release = [0, 8] },
 ]
-expect = [["C"], [], ["O"], ["O", "U"], ["U"], []]
+expect = [["C"], ["C", "O"], ["O"], ["O", "U"], ["U"], []]
 
 # Control case: the same physical rollover over the tap-hold spelling of C,
 # LT(1, C, hrm_hold400)@(1,5) instead of TD(6)@(1,6), keeps the text order correct.

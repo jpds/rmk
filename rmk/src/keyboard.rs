@@ -3,7 +3,7 @@ use core::fmt::Debug;
 use embassy_futures::yield_now;
 #[cfg(feature = "_ble")]
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Instant, Timer, with_deadline};
+use embassy_time::{Duration, Instant, with_deadline};
 use heapless::Vec;
 use rmk_types::action::{Action, KeyAction, KeyboardAction};
 use rmk_types::fork::StateBits;
@@ -144,13 +144,15 @@ impl Runnable for Keyboard<'_> {
                 // Process buffered held key
                 self.process_buffered_key(key).await
             } else {
-                // If a mouse repeat, one-shot expiry, or User-key hold is pending,
-                // race the subscriber against the earliest deadline
+                // If a mouse repeat, one-shot expiry, User-key hold, or pending
+                // tap release is pending, race the subscriber against the
+                // earliest deadline
                 let deadline = [
                     self.mouse.next_deadline(),
                     self.osm_deadline,
                     self.osl_deadline,
                     self.user_hold_deadline,
+                    self.pending_tap_releases.first().map(|(.., d)| *d),
                 ]
                 .into_iter()
                 .flatten()
@@ -160,6 +162,7 @@ impl Runnable for Keyboard<'_> {
                         Ok(event) => event,
                         Err(_) => {
                             // Deadline expired: fire pending expiries and/or mouse repeat
+                            self.fire_expired_tap_releases().await;
                             self.fire_oneshot_timeout().await;
                             self.fire_user_hold_timeout().await;
                             if self.mouse.next_deadline().is_some_and(|d| d <= Instant::now()) {
@@ -225,6 +228,11 @@ pub struct Keyboard<'a> {
     user_hold_deadline: Option<Instant>,
     user_hold_id: u8,
 
+    /// Pending Tap-action releases: `(action, release event, fire deadline)`,
+    /// pushed in deadline order. Drained by `run()`'s deadline race on
+    /// expiry, or in full by press-time flushes.
+    pending_tap_releases: Vec<(Action, KeyboardEvent, Instant), 16>,
+
     /// Caps Word state machine
     caps_word: CapsWordState,
 
@@ -282,6 +290,7 @@ impl<'a> Keyboard<'a> {
             osm_deadline: None,
             user_hold_deadline: None,
             user_hold_id: 0,
+            pending_tap_releases: Vec::new(),
             caps_word: CapsWordState::default(),
             with_modifiers: ModifierCombination::default(),
             macro_texting: false,
@@ -411,6 +420,10 @@ impl<'a> Keyboard<'a> {
         is_combo: bool,
         event_time: Instant,
     ) {
+        if event.pressed {
+            self.flush_pending_tap_releases().await;
+        }
+
         // First, make the decision for current key and held keys
         let (decision_for_current_key, decisions) = self.make_decisions_for_keys(key_action, event);
 
@@ -504,6 +517,9 @@ impl<'a> Keyboard<'a> {
         mut decision_for_current_key: KeyBehaviorDecision,
         decisions: Vec<(KeyboardEventPos, HeldKeyDecision), 16>,
     ) -> (bool, KeyBehaviorDecision) {
+        if !decisions.is_empty() {
+            self.flush_pending_tap_releases().await;
+        }
         let mut keyboard_state_updated = false;
         // Fire buffered keys
         for (pos, decision) in decisions {
@@ -837,6 +853,13 @@ impl<'a> Keyboard<'a> {
         event: KeyboardEvent,
         event_time: Instant,
     ) {
+        // Firing buffered keys (above, in `fire_held_keys`) can queue new tap
+        // releases; flush them before this event's own key registers, or the
+        // two would share one HID frame.
+        if event.pressed {
+            self.flush_pending_tap_releases().await;
+        }
+
         // Start forks
         let key_action = self.try_start_forks(original_key_action, event);
 
@@ -1388,17 +1411,42 @@ impl<'a> Keyboard<'a> {
         }
     }
 
-    /// Tap action, send a key when the key is pressed, then release the key.
+    /// Tap action, send a key when the key is pressed, then schedule the
+    /// release ~10ms later via the deadline race in `run()`, keeping the
+    /// pulse host-visible while the keyboard task keeps servicing events.
     async fn process_key_action_tap(&mut self, action: Action, mut event: KeyboardEvent) {
         debug!("TAP action: {:?}, {:?}", action, event);
 
         if event.pressed {
             self.process_key_action_normal(action, event).await;
 
-            // Wait 10ms, then send release
-            Timer::after_millis(10).await;
-
             event.pressed = false;
+            let deadline = Instant::now() + Duration::from_millis(10);
+            if let Err((action, event, _)) = self.pending_tap_releases.push((action, event, deadline)) {
+                error!("Pending tap releases full, releasing early: {:?}", action);
+                self.process_key_action_normal(action, event).await;
+            }
+        }
+    }
+
+    /// Send every pending tap release, oldest first, ignoring deadlines.
+    /// Called at each press entry point so a press never lands while an
+    /// earlier tap's release is still queued. Must stay out of
+    /// `process_key_action_normal`'s call tree: it applies releases through
+    /// that function (async recursion).
+    async fn flush_pending_tap_releases(&mut self) {
+        while !self.pending_tap_releases.is_empty() {
+            let (action, event, _) = self.pending_tap_releases.remove(0);
+            self.process_key_action_normal(action, event).await;
+        }
+    }
+
+    /// Send the release report of every expired pending tap release, oldest
+    /// first. Entries are pushed in deadline order, so the first expires first.
+    async fn fire_expired_tap_releases(&mut self) {
+        let now = Instant::now();
+        while self.pending_tap_releases.first().is_some_and(|(.., d)| *d <= now) {
+            let (action, event, _) = self.pending_tap_releases.remove(0);
             self.process_key_action_normal(action, event).await;
         }
     }
@@ -1798,6 +1846,9 @@ impl<'a> Keyboard<'a> {
     }
 
     async fn execute_macro(&mut self, macro_idx: u8, event: KeyboardEvent) {
+        if event.pressed {
+            self.flush_pending_tap_releases().await;
+        }
         // Read macro operations until the end of the macro
         let macro_idx = self.keymap.get_macro_sequence_start(macro_idx);
         if let Some(macro_start_idx) = macro_idx {
