@@ -31,7 +31,7 @@ use crate::keyboard::mouse::{MouseAction, MouseState};
 use crate::keyboard::oneshot::OneShotState;
 use crate::keyboard_macros::MacroOperation;
 use crate::keymap::KeyMap;
-use crate::{COMBO_MAX_NUM, FORK_MAX_NUM, MACRO_SPACE_SIZE, boot};
+use crate::{COMBO_MAX_NUM, COMBO_SIZE, FORK_MAX_NUM, MACRO_SPACE_SIZE, boot};
 
 pub(crate) mod auto_mouse_layer;
 pub mod combo;
@@ -144,14 +144,15 @@ impl Runnable for Keyboard<'_> {
                 // Process buffered held key
                 self.process_buffered_key(key).await
             } else {
-                // If a mouse repeat, one-shot expiry, User-key hold, or pending
-                // tap release is pending, race the subscriber against the
-                // earliest deadline
+                // If a mouse repeat, one-shot expiry, User-key hold, pending
+                // tap release, or delayed-combo reset is pending, race the
+                // subscriber against the earliest deadline
                 let deadline = [
                     self.mouse.next_deadline(),
                     self.osm_deadline,
                     self.osl_deadline,
                     self.user_hold_deadline,
+                    self.combo_reset_deadline,
                     self.pending_tap_releases.first().map(|(.., d)| *d),
                 ]
                 .into_iter()
@@ -163,6 +164,7 @@ impl Runnable for Keyboard<'_> {
                         Err(_) => {
                             // Deadline expired: fire pending expiries and/or mouse repeat
                             self.fire_expired_tap_releases().await;
+                            self.fire_shadowed_combo_reset().await;
                             self.fire_oneshot_timeout().await;
                             self.fire_user_hold_timeout().await;
                             if self.mouse.next_deadline().is_some_and(|d| d <= Instant::now()) {
@@ -233,6 +235,11 @@ pub struct Keyboard<'a> {
     /// expiry, or in full by press-time flushes.
     pending_tap_releases: Vec<(Action, KeyboardEvent, Instant), 16>,
 
+    /// Deadline for resetting the combos shadowed by triggered delayed combos,
+    /// together with the actions collected for that reset. `None` when idle.
+    combo_reset_deadline: Option<Instant>,
+    combo_reset_actions: Vec<KeyAction, COMBO_SIZE>,
+
     /// Caps Word state machine
     caps_word: CapsWordState,
 
@@ -291,6 +298,8 @@ impl<'a> Keyboard<'a> {
             user_hold_deadline: None,
             user_hold_id: 0,
             pending_tap_releases: Vec::new(),
+            combo_reset_deadline: None,
+            combo_reset_actions: Vec::new(),
             caps_word: CapsWordState::default(),
             with_modifiers: ModifierCombination::default(),
             macro_texting: false,
@@ -1069,10 +1078,34 @@ impl<'a> Keyboard<'a> {
             new_event.pressed = true;
             self.process_key_action(&action, new_event, true, Instant::now()).await;
             debug!("[Combo] {:?} triggered", action);
-            embassy_time::Timer::after_millis(20).await;
-            // Reset other combos shadowed by the one that just fired.
-            self.reset_shadowed_combos(&combo_actions);
+            // Defer the shadowed-combo reset to the deadline race in `run()`:
+            // the output lands first and the sub-combos reset 20ms later,
+            // without blocking the task in between.
+            if self.combo_reset_actions.len() + combo_actions.len() > COMBO_SIZE {
+                // Pending reset is full: reset what's queued now, then re-arm
+                // with this combo's actions
+                let actions = core::mem::take(&mut self.combo_reset_actions);
+                self.reset_shadowed_combos(&actions);
+                self.combo_reset_actions = combo_actions;
+            } else {
+                for action in combo_actions.iter() {
+                    let _ = self.combo_reset_actions.push(*action);
+                }
+            }
+            self.combo_reset_deadline = Some(Instant::now() + Duration::from_millis(20));
         }
+    }
+
+    /// Reset the combos shadowed by triggered delayed combos once their 20ms
+    /// window expires. Called from `run()`'s deadline race; re-checks the
+    /// timestamp, so a call before expiry is a no-op.
+    async fn fire_shadowed_combo_reset(&mut self) {
+        if !self.combo_reset_deadline.is_some_and(|d| d <= Instant::now()) {
+            return;
+        }
+        self.combo_reset_deadline = None;
+        let actions = core::mem::take(&mut self.combo_reset_actions);
+        self.reset_shadowed_combos(&actions);
     }
 
     // Reset combos shadowed by a just-triggered combo: any *other* combo that is
