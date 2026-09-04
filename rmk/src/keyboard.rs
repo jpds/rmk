@@ -157,10 +157,9 @@ impl Runnable for Keyboard<'_> {
                 None => self.fire_due(Instant::now()).await,
             }
 
-            // Run any macros triggered while handling the event.
-            while let Ok((macro_idx, event)) = crate::channel::MACRO_TRIGGER_CHANNEL.try_receive() {
-                self.execute_macro(macro_idx, event).await;
-            }
+            // Start the next queued macro, if none is running; its steps
+            // advance via the `MacroStep` deadline.
+            self.pump_macros().await;
 
             self.sync_deadlines();
         }
@@ -182,6 +181,8 @@ enum KeyboardDeadline {
     BufferedKey,
     /// Mouse acceleration repeat tick
     MouseRepeat,
+    /// Advance of the in-progress macro by one step
+    MacroStep,
 }
 
 /// One slot per [`KeyboardDeadline`].
@@ -201,8 +202,37 @@ impl DeadlineKey for KeyboardDeadline {
             KeyboardDeadline::UserHold => 3,
             KeyboardDeadline::BufferedKey => 3 + cfg!(feature = "_ble") as usize,
             KeyboardDeadline::MouseRepeat => 4 + cfg!(feature = "_ble") as usize,
+            KeyboardDeadline::MacroStep => 5 + cfg!(feature = "_ble") as usize,
         }
     }
+}
+
+/// One in-progress macro: the triggering event, the sequence start, the read
+/// offset, and the step to execute next.
+struct MacroRun {
+    event: KeyboardEvent,
+    macro_start_idx: usize,
+    offset: usize,
+    phase: MacroPhase,
+}
+
+/// The next step of a running macro. `Op` executes the operation at `offset`;
+/// the other phases finish a multi-stage operation (Tap/TapAction/Text) whose
+/// earlier stages already ran.
+enum MacroPhase {
+    Op,
+    /// Release the key pressed by `MacroOperation::Tap`
+    TapRelease(HidKeyCode),
+    /// Release the action pressed by `MacroOperation::TapAction`
+    #[cfg(feature = "vial")]
+    TapActionRelease(Action),
+    /// Press the key of a `MacroOperation::Text` (the caps report already went out)
+    TextPress(HidKeyCode),
+    /// Release the key of a `MacroOperation::Text`; `was_cap` selects the
+    /// trailing cap-off stage
+    TextRelease(HidKeyCode, bool),
+    /// Send the final report of a capped `MacroOperation::Text`
+    TextCapOff,
 }
 
 pub struct Keyboard<'a> {
@@ -257,7 +287,8 @@ pub struct Keyboard<'a> {
 
     /// Deadlines for `run()` to race the event subscriber against. Most kinds
     /// are re-derived from their sources by `sync_deadlines()` at the end of
-    /// every loop iteration; `UserHold` is armed where its payload lives.
+    /// every loop iteration; `UserHold` and `MacroStep` are armed where their
+    /// payloads live.
     deadlines: KeyboardDeadlines,
 
     /// Caps Word state machine
@@ -269,6 +300,11 @@ pub struct Keyboard<'a> {
     /// Macro text typing state (affects the effective modifiers)
     macro_texting: bool,
     macro_caps: bool,
+
+    /// In-progress macro execution, one deadline-driven step at a time: the
+    /// next step fires on the `MacroStep` deadline. Queued triggers wait in
+    /// `MACRO_TRIGGER_CHANNEL` until the current macro completes.
+    macro_run: Option<MacroRun>,
 
     /// The real state before fork activations is stored here
     fork_states: [Option<ActiveFork>; FORK_MAX_NUM], // chosen replacement key of the currently triggered forks and the related modifier suppression
@@ -323,6 +359,7 @@ impl<'a> Keyboard<'a> {
             with_modifiers: ModifierCombination::default(),
             macro_texting: false,
             macro_caps: false,
+            macro_run: None,
             fork_states: [None; FORK_MAX_NUM],
             fork_keep_mask: ModifierCombination::default(),
             held_buffer: HeldBuffer::new(),
@@ -400,6 +437,10 @@ impl<'a> Keyboard<'a> {
             self.deadlines.clear(KeyboardDeadline::MouseRepeat);
             self.fire_mouse_repeat().await;
         }
+        if self.deadlines.is_due(KeyboardDeadline::MacroStep, now) {
+            self.deadlines.clear(KeyboardDeadline::MacroStep);
+            self.advance_macro().await;
+        }
     }
 
     /// Re-derive the source-owned registry entries (the tap queue head, the
@@ -425,6 +466,9 @@ impl<'a> Keyboard<'a> {
         };
         self.deadlines.set_or_clear(KeyboardDeadline::OneShotModifier, osm);
         self.deadlines.set_or_clear(KeyboardDeadline::OneShotLayer, osl);
+        if self.macro_run.is_none() {
+            self.deadlines.clear(KeyboardDeadline::MacroStep);
+        }
         #[cfg(feature = "_ble")]
         if self.user_hold.is_none() {
             self.deadlines.clear(KeyboardDeadline::UserHold);
@@ -1933,119 +1977,176 @@ impl<'a> Keyboard<'a> {
         }
     }
 
-    async fn execute_macro(&mut self, macro_idx: u8, event: KeyboardEvent) {
-        if event.pressed {
-            self.flush_pending_tap_releases().await;
+    /// Start the next queued macro, if none is running. Its steps then advance
+    /// one at a time via the `MacroStep` deadline in `fire_due`, so the
+    /// keyboard task keeps servicing events between macro steps.
+    async fn pump_macros(&mut self) {
+        if self.macro_run.is_some() {
+            return;
         }
-        // Read macro operations until the end of the macro
-        let macro_idx = self.keymap.get_macro_sequence_start(macro_idx);
-        if let Some(macro_start_idx) = macro_idx {
-            let mut offset = 0;
-            loop {
-                // First, get the next macro operation
-                let (operation, new_offset) = self.keymap.get_next_macro_operation(macro_start_idx, offset);
-                // Execute the operation
-                match operation {
-                    MacroOperation::Press(k) => {
-                        self.macro_texting = false;
-                        self.register_key(k, event);
-                        self.send_keyboard_report_with_resolved_modifiers(true).await;
-                    }
-                    MacroOperation::Release(k) => {
-                        self.macro_texting = false;
-                        self.unregister_key(k, event);
-                        self.send_keyboard_report_with_resolved_modifiers(false).await;
-                    }
-                    MacroOperation::Tap(k) => {
-                        self.macro_texting = false;
-                        self.register_key(k, event);
-                        self.send_keyboard_report_with_resolved_modifiers(true).await;
-                        embassy_time::Timer::after_millis(2).await;
-                        self.unregister_key(k, event);
-                        self.send_keyboard_report_with_resolved_modifiers(false).await;
-                    }
-                    // A macro can't trigger another macro: that would re-enter this queue, and a
-                    // self- or cycle-triggering macro would loop here forever. Drop it at the source.
-                    #[cfg(feature = "vial")]
-                    MacroOperation::PressAction(Action::TriggerMacro(_))
-                    | MacroOperation::ReleaseAction(Action::TriggerMacro(_))
-                    | MacroOperation::TapAction(Action::TriggerMacro(_)) => {
-                        warn!("A macro cannot trigger another macro");
-                    }
-                    // Extended (16-bit) keycodes (BT profile, PDF, ...) run the decoded action
-                    // through the normal dispatcher, with press/release synthesized from the event.
-                    #[cfg(feature = "vial")]
-                    MacroOperation::PressAction(action) => {
-                        self.macro_texting = false;
-                        self.process_key_action_normal(action, KeyboardEvent { pressed: true, ..event })
-                            .await;
-                    }
-                    #[cfg(feature = "vial")]
-                    MacroOperation::ReleaseAction(action) => {
-                        self.macro_texting = false;
-                        self.process_key_action_normal(
-                            action,
-                            KeyboardEvent {
-                                pressed: false,
-                                ..event
-                            },
-                        )
-                        .await;
-                    }
-                    #[cfg(feature = "vial")]
-                    MacroOperation::TapAction(action) => {
-                        self.macro_texting = false;
-                        self.process_key_action_normal(action, KeyboardEvent { pressed: true, ..event })
-                            .await;
-                        embassy_time::Timer::after_millis(2).await;
-                        self.process_key_action_normal(
-                            action,
-                            KeyboardEvent {
-                                pressed: false,
-                                ..event
-                            },
-                        )
-                        .await;
-                    }
-                    MacroOperation::Text(k, is_cap) => {
-                        self.macro_texting = true;
-                        self.macro_caps = is_cap;
-                        if is_cap {
-                            self.send_keyboard_report_with_resolved_modifiers(true).await;
-                            embassy_time::Timer::after_millis(12).await;
-                        }
-                        self.register_keycode(k, event);
-                        self.send_keyboard_report_with_resolved_modifiers(true).await;
-                        embassy_time::Timer::after_millis(12).await;
-                        self.unregister_keycode(k, event);
-                        self.send_keyboard_report_with_resolved_modifiers(false).await;
-                        if is_cap {
-                            self.macro_caps = false;
-                            embassy_time::Timer::after_millis(12).await;
-                            self.send_keyboard_report_with_resolved_modifiers(false).await;
-                        }
-                    }
-                    MacroOperation::Delay(t) => {
-                        embassy_time::Timer::after_millis(t as u64).await;
-                    }
-                    MacroOperation::End => {
-                        if self.macro_texting {
-                            //restore the state of the keyboard (held modifiers, etc.) after text typing
-                            self.send_keyboard_report_with_resolved_modifiers(false).await;
-                            self.macro_texting = false;
-                        }
-                        break;
-                    }
-                };
-
-                offset = new_offset;
-                if offset > MACRO_SPACE_SIZE {
-                    break;
-                }
-                embassy_time::Timer::after_millis(1).await;
+        if let Ok((macro_idx, event)) = crate::channel::MACRO_TRIGGER_CHANNEL.try_receive() {
+            if event.pressed {
+                self.flush_pending_tap_releases().await;
             }
-        } else {
-            error!("Macro not found");
+            match self.keymap.get_macro_sequence_start(macro_idx) {
+                Some(macro_start_idx) => {
+                    self.macro_run = Some(MacroRun {
+                        event,
+                        macro_start_idx,
+                        offset: 0,
+                        phase: MacroPhase::Op,
+                    });
+                    self.advance_macro().await;
+                }
+                None => error!("Macro not found"),
+            }
+        }
+    }
+
+    /// Execute the current phase of the running macro and schedule the next
+    /// step. Operations are fetched lazily per step, not up front.
+    async fn advance_macro(&mut self) {
+        let Some(MacroRun {
+            event,
+            macro_start_idx,
+            offset,
+            phase,
+        }) = self.macro_run.take()
+        else {
+            return;
+        };
+        let mut run = MacroRun {
+            event,
+            macro_start_idx,
+            offset,
+            phase: MacroPhase::Op,
+        };
+        let mut delay = Some(Duration::from_millis(1));
+
+        match phase {
+            MacroPhase::Op => {
+                let (operation, new_offset) = self.keymap.get_next_macro_operation(macro_start_idx, offset);
+                if new_offset > MACRO_SPACE_SIZE {
+                    // The offset ran past the macro space; end the macro here.
+                    delay = None;
+                } else {
+                    run.offset = new_offset;
+                    match operation {
+                        MacroOperation::Press(k) => {
+                            self.macro_texting = false;
+                            self.register_key(k, event);
+                            self.send_keyboard_report_with_resolved_modifiers(true).await;
+                        }
+                        MacroOperation::Release(k) => {
+                            self.macro_texting = false;
+                            self.unregister_key(k, event);
+                            self.send_keyboard_report_with_resolved_modifiers(false).await;
+                        }
+                        MacroOperation::Tap(k) => {
+                            self.macro_texting = false;
+                            self.register_key(k, event);
+                            self.send_keyboard_report_with_resolved_modifiers(true).await;
+                            run.phase = MacroPhase::TapRelease(k);
+                            delay = Some(Duration::from_millis(2));
+                        }
+                        // A macro can't trigger another macro: that would re-enter this queue, and a
+                        // self- or cycle-triggering macro would loop here forever. Drop it at the source.
+                        #[cfg(feature = "vial")]
+                        MacroOperation::PressAction(Action::TriggerMacro(_))
+                        | MacroOperation::ReleaseAction(Action::TriggerMacro(_))
+                        | MacroOperation::TapAction(Action::TriggerMacro(_)) => {
+                            warn!("A macro cannot trigger another macro");
+                        }
+                        // Extended (16-bit) keycodes (BT profile, PDF, ...) run the decoded action
+                        // through the normal dispatcher, with press/release synthesized from the event.
+                        #[cfg(feature = "vial")]
+                        MacroOperation::PressAction(action) => {
+                            self.macro_texting = false;
+                            self.process_key_action_normal(action, KeyboardEvent { pressed: true, ..event })
+                                .await;
+                        }
+                        #[cfg(feature = "vial")]
+                        MacroOperation::ReleaseAction(action) => {
+                            self.macro_texting = false;
+                            self.process_key_action_normal(
+                                action,
+                                KeyboardEvent {
+                                    pressed: false,
+                                    ..event
+                                },
+                            )
+                            .await;
+                        }
+                        #[cfg(feature = "vial")]
+                        MacroOperation::TapAction(action) => {
+                            self.macro_texting = false;
+                            self.process_key_action_normal(action, KeyboardEvent { pressed: true, ..event })
+                                .await;
+                            run.phase = MacroPhase::TapActionRelease(action);
+                            delay = Some(Duration::from_millis(2));
+                        }
+                        MacroOperation::Text(k, is_cap) => {
+                            self.macro_texting = true;
+                            self.macro_caps = is_cap;
+                            if is_cap {
+                                self.send_keyboard_report_with_resolved_modifiers(true).await;
+                                run.phase = MacroPhase::TextPress(k);
+                            } else {
+                                self.register_keycode(k, event);
+                                self.send_keyboard_report_with_resolved_modifiers(true).await;
+                                run.phase = MacroPhase::TextRelease(k, false);
+                            }
+                            delay = Some(Duration::from_millis(12));
+                        }
+                        MacroOperation::Delay(t) => {
+                            delay = Some(Duration::from_millis(t as u64 + 1));
+                        }
+                        MacroOperation::End => delay = None,
+                    }
+                }
+            }
+            MacroPhase::TapRelease(k) => {
+                self.unregister_key(k, event);
+                self.send_keyboard_report_with_resolved_modifiers(false).await;
+            }
+            #[cfg(feature = "vial")]
+            MacroPhase::TapActionRelease(action) => {
+                self.process_key_action_normal(
+                    action,
+                    KeyboardEvent {
+                        pressed: false,
+                        ..event
+                    },
+                )
+                .await;
+            }
+            MacroPhase::TextPress(k) => {
+                self.register_keycode(k, event);
+                self.send_keyboard_report_with_resolved_modifiers(true).await;
+                run.phase = MacroPhase::TextRelease(k, true);
+                delay = Some(Duration::from_millis(12));
+            }
+            MacroPhase::TextRelease(k, was_cap) => {
+                self.unregister_keycode(k, event);
+                self.send_keyboard_report_with_resolved_modifiers(false).await;
+                if was_cap {
+                    self.macro_caps = false;
+                    run.phase = MacroPhase::TextCapOff;
+                    delay = Some(Duration::from_millis(12));
+                }
+            }
+            MacroPhase::TextCapOff => {
+                self.send_keyboard_report_with_resolved_modifiers(false).await;
+            }
+        }
+
+        if let Some(delay) = delay {
+            self.macro_run = Some(run);
+            self.deadlines.set(KeyboardDeadline::MacroStep, Instant::now() + delay);
+        } else if self.macro_texting {
+            // Restore the state of the keyboard (held modifiers, etc.) after text typing
+            self.send_keyboard_report_with_resolved_modifiers(false).await;
+            self.macro_texting = false;
         }
     }
 
